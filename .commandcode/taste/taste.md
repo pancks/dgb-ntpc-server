@@ -1,0 +1,3 @@
+- User communicates in Indonesian. Prefer Indonesian for confirmations/summary unless code-only. Confidence: 0.95
+- Uses PlatformIO for ESP32 development, Arduino framework. Confidence: 0.9
+- Cares about correct hardware config matching spec (flash size, PSRAM type, CPU freq). Confidence: 0.85
