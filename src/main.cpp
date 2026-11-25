@@ -10,6 +10,8 @@
 #include <Wire.h>
 #include <ETH.h>
 #include <WiFi.h>
+#include <Preferences.h>
+#include "mbedtls/base64.h"
 #include <TinyGPSPlus.h>
 #include <RTClib.h>
 #include "esp_timer.h"
@@ -43,18 +45,151 @@
 // ===================== CONFIG =====================
 static const uint32_t BAUDS[] = {9600, 115200, 38400, 57600, 4800};   // scanned in this order
 static const uint8_t  N_BAUDS = sizeof(BAUDS) / sizeof(BAUDS[0]);
-// WiFi (station mode). Ethernet and WiFi run in parallel; the status page answers on either IP.
-static const bool WIFI_ENABLED = true;   // set false to test GNSS reception with the WiFi radio off
-#define WIFI_SSID "Digiboy"
-#define WIFI_PASS "DGBsemangat"
+// Network, time-source and security options live in flash now: edit them at http://<ip>/settings
 static const uint32_t GNSS1_BAUD = 115200;       // fixed baud for GNSS1 (ME31GR01)
 static const uint32_t GNSS2_BAUD = 9600;         // fixed baud for GNSS2 (NEO-M8N)
 static const bool     GNSS_AUTOBAUD = false;     // true = scan BAUDS[] if no valid NMEA arrives
 static const uint32_t GNSS_HOLD_MS = 3000;       // no fresh fix-time for this long -> source lost
 static const bool     GNSS1_RESET_ON_BOOT = true; // assumes ACTIVE-LOW reset, see note below
 
+// ===================== SETTINGS (stored in flash, edited at /settings) =====================
+// First boot uses these defaults. Everything below can be changed from the web page without reflashing.
+struct Settings {
+  char     hostname[33];
+  bool     ethEnabled, ethDhcp;
+  uint32_t ethIp, ethMask, ethGw, ethDns;      // IPv4 stored as (uint32_t)IPAddress, 0 = unset
+  bool     wifiEnabled, wifiDhcp;
+  char     wifiSsid[33], wifiPass[65];
+  uint32_t wifiIp, wifiMask, wifiGw, wifiDns;
+  bool     srcEnabled[3];                      // 0 = GNSS1, 1 = GNSS2, 2 = RTC
+  uint8_t  srcPrio[3];                         // 1 = tried first
+  char     webPass[33];                        // empty = web UI is open (user name is always "admin")
+  char     allow[129];                         // allowed NTP clients, e.g. "192.168.1.0/24, 10.0.0.5"; empty = everyone
+};
+Settings cfg;       // active settings
+Settings draft;     // form values being validated
+Preferences prefs;
+
+uint8_t  srcOrder[3] = {0, 1, 2};              // source ids, best first (derived from cfg.srcPrio)
+uint32_t allowNet[8], allowMask[8];            // parsed allow list, host byte order
+uint8_t  allowCount = 0;
+
+void settingsDefaults() {
+  memset(&cfg, 0, sizeof cfg);
+  strlcpy(cfg.hostname, "zaimu-ntps", sizeof cfg.hostname);
+  cfg.ethEnabled = true;  cfg.ethDhcp = true;
+  cfg.wifiEnabled = true; cfg.wifiDhcp = true;
+  strlcpy(cfg.wifiSsid, "Digiboy", sizeof cfg.wifiSsid);
+  strlcpy(cfg.wifiPass, "DGBsemangat", sizeof cfg.wifiPass);
+  for (int i = 0; i < 3; i++) { cfg.srcEnabled[i] = true; cfg.srcPrio[i] = i + 1; }
+}
+
+// Parses "1.2.3.4, 10.0.0.0/8 ..." into net/mask pairs. Returns false on any malformed entry.
+bool parseAllowList(const char *text, uint32_t *net, uint32_t *mask, uint8_t &count) {
+  count = 0;
+  char buf[130];
+  strlcpy(buf, text, sizeof buf);
+  char *save = nullptr;
+  for (char *tok = strtok_r(buf, ", ;\t\r\n", &save); tok; tok = strtok_r(nullptr, ", ;\t\r\n", &save)) {
+    if (count >= 8) return false;
+    int prefix = 32;
+    char *slash = strchr(tok, '/');
+    if (slash) {
+      *slash = 0;
+      char *end = nullptr;
+      long p = strtol(slash + 1, &end, 10);
+      if (end == slash + 1 || *end != 0 || p < 0 || p > 32) return false;
+      prefix = (int)p;
+    }
+    IPAddress ip;
+    if (!ip.fromString(tok)) return false;
+    uint32_t m = (prefix == 0) ? 0 : (0xFFFFFFFFu << (32 - prefix));
+    net[count] = __builtin_bswap32((uint32_t)ip) & m;
+    mask[count] = m;
+    count++;
+  }
+  return true;
+}
+
+bool ntpAllowed(uint32_t ipMem) {
+  if (allowCount == 0) return true;
+  uint32_t h = __builtin_bswap32(ipMem);
+  for (uint8_t i = 0; i < allowCount; i++) {
+    if ((h & allowMask[i]) == allowNet[i]) return true;
+  }
+  return false;
+}
+
+void settingsApplyDerived() {
+  uint8_t ids[3] = {0, 1, 2};
+  for (int a = 0; a < 3; a++) {
+    for (int b = a + 1; b < 3; b++) {
+      if (cfg.srcPrio[ids[b]] < cfg.srcPrio[ids[a]]) { uint8_t t = ids[a]; ids[a] = ids[b]; ids[b] = t; }
+    }
+  }
+  memcpy(srcOrder, ids, 3);
+  if (!parseAllowList(cfg.allow, allowNet, allowMask, allowCount)) allowCount = 0;
+}
+
+void settingsLoad() {
+  settingsDefaults();
+  if (!prefs.begin("ntps", false)) return;
+  String s;
+  s = prefs.getString("host", cfg.hostname);   strlcpy(cfg.hostname, s.c_str(), sizeof cfg.hostname);
+  cfg.ethEnabled = prefs.getBool("eEn", cfg.ethEnabled);
+  cfg.ethDhcp    = prefs.getBool("eDhcp", cfg.ethDhcp);
+  cfg.ethIp      = prefs.getUInt("eIp", 0);
+  cfg.ethMask    = prefs.getUInt("eMask", 0);
+  cfg.ethGw      = prefs.getUInt("eGw", 0);
+  cfg.ethDns     = prefs.getUInt("eDns", 0);
+  cfg.wifiEnabled = prefs.getBool("wEn", cfg.wifiEnabled);
+  cfg.wifiDhcp    = prefs.getBool("wDhcp", cfg.wifiDhcp);
+  s = prefs.getString("wSsid", cfg.wifiSsid);  strlcpy(cfg.wifiSsid, s.c_str(), sizeof cfg.wifiSsid);
+  s = prefs.getString("wPass", cfg.wifiPass);  strlcpy(cfg.wifiPass, s.c_str(), sizeof cfg.wifiPass);
+  cfg.wifiIp   = prefs.getUInt("wIp", 0);
+  cfg.wifiMask = prefs.getUInt("wMask", 0);
+  cfg.wifiGw   = prefs.getUInt("wGw", 0);
+  cfg.wifiDns  = prefs.getUInt("wDns", 0);
+  uint8_t en = prefs.getUChar("sEn", 7);
+  uint32_t pk = prefs.getUInt("sPrio", 0x030201);
+  for (int i = 0; i < 3; i++) {
+    cfg.srcEnabled[i] = (en >> i) & 1;
+    uint8_t p = (pk >> (8 * i)) & 0xFF;
+    cfg.srcPrio[i] = (p >= 1 && p <= 3) ? p : (i + 1);
+  }
+  s = prefs.getString("webPass", "");          strlcpy(cfg.webPass, s.c_str(), sizeof cfg.webPass);
+  s = prefs.getString("allow", "");            strlcpy(cfg.allow, s.c_str(), sizeof cfg.allow);
+  prefs.end();
+}
+
+void settingsSave() {
+  prefs.begin("ntps", false);
+  prefs.putString("host", cfg.hostname);
+  prefs.putBool("eEn", cfg.ethEnabled);   prefs.putBool("eDhcp", cfg.ethDhcp);
+  prefs.putUInt("eIp", cfg.ethIp);        prefs.putUInt("eMask", cfg.ethMask);
+  prefs.putUInt("eGw", cfg.ethGw);        prefs.putUInt("eDns", cfg.ethDns);
+  prefs.putBool("wEn", cfg.wifiEnabled);  prefs.putBool("wDhcp", cfg.wifiDhcp);
+  prefs.putString("wSsid", cfg.wifiSsid); prefs.putString("wPass", cfg.wifiPass);
+  prefs.putUInt("wIp", cfg.wifiIp);       prefs.putUInt("wMask", cfg.wifiMask);
+  prefs.putUInt("wGw", cfg.wifiGw);       prefs.putUInt("wDns", cfg.wifiDns);
+  uint8_t en = 0;
+  for (int i = 0; i < 3; i++) if (cfg.srcEnabled[i]) en |= (1 << i);
+  prefs.putUChar("sEn", en);
+  prefs.putUInt("sPrio", (uint32_t)cfg.srcPrio[0] | ((uint32_t)cfg.srcPrio[1] << 8) | ((uint32_t)cfg.srcPrio[2] << 16));
+  prefs.putString("webPass", cfg.webPass);
+  prefs.putString("allow", cfg.allow);
+  prefs.end();
+}
+
+void settingsErase() {
+  prefs.begin("ntps", false);
+  prefs.clear();
+  prefs.end();
+}
+
 // ===================== PPS (interrupts) =====================
 portMUX_TYPE ppsMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE timeMux = portMUX_INITIALIZER_UNLOCKED;   // guards the time anchors shared with the NTP task
 volatile uint32_t ppsCount[2] = {0, 0};
 volatile int64_t  ppsUs[2]    = {0, 0};
 
@@ -127,11 +262,15 @@ void gnssOnSentence(int i) {
       uint32_t cnt; int64_t pus;
       readPps(i, cnt, pus);
       bool aligned = cnt > 0 && (now - pus) >= 0 && (now - pus) < 900000;  // PPS edge just before this sentence
-      g.anchorEpoch = dt.unixtime();
+      uint32_t ep = dt.unixtime();
+      uint32_t wall = millis();
+      portENTER_CRITICAL(&timeMux);
+      g.anchorEpoch = ep;
       g.anchorUs = aligned ? pus : now;
       g.ppsAligned = aligned;
       g.anchorValid = true;
-      g.anchorWallMs = millis();
+      g.anchorWallMs = wall;
+      portEXIT_CRITICAL(&timeMux);
     }
   }
 }
@@ -202,12 +341,19 @@ void pollRtc() {
   rtcPresent = (Wire.endTransmission() == 0);
   if (!rtcPresent) { rtcValid = false; return; }
   if (!rtcInitOk) rtcInitOk = rtc.begin(&Wire);
-  rtcLost = rtc.lostPower();
+  bool lost = rtc.lostPower();
   DateTime n = rtc.now();
-  rtcEpoch = n.unixtime();
-  rtcReadUs = esp_timer_get_time();
-  rtcTemp = rtc.getTemperature();
-  rtcValid = !rtcLost && n.year() >= 2024;
+  uint32_t ep = n.unixtime();
+  int64_t rus = esp_timer_get_time();
+  float temp = rtc.getTemperature();
+  bool valid = !lost && n.year() >= 2024;
+  portENTER_CRITICAL(&timeMux);
+  rtcLost = lost;
+  rtcEpoch = ep;
+  rtcReadUs = rus;
+  rtcValid = valid;
+  portEXIT_CRITICAL(&timeMux);
+  rtcTemp = temp;
 }
 uint32_t rtcNowEpoch() {
   return rtcEpoch + (uint32_t)((esp_timer_get_time() - rtcReadUs) / 1000000);
@@ -218,9 +364,12 @@ enum Src { SRC_NONE, SRC_GNSS1, SRC_GNSS2, SRC_RTC };
 const char *SRC_NAME[] = {"NONE", "GNSS1", "GNSS2", "RTC"};
 
 Src selectSource() {
-  if (gnssUsable(0)) return SRC_GNSS1;
-  if (gnssUsable(1)) return SRC_GNSS2;
-  if (rtcPresent && rtcValid) return SRC_RTC;
+  for (int k = 0; k < 3; k++) {
+    int id = srcOrder[k];
+    if (!cfg.srcEnabled[id]) continue;
+    if (id < 2) { if (gnssUsable(id)) return id == 0 ? SRC_GNSS1 : SRC_GNSS2; }
+    else if (rtcPresent && rtcValid) return SRC_RTC;
+  }
   return SRC_NONE;
 }
 
@@ -274,26 +423,180 @@ void onEvent(arduino_event_id_t event) {
     case ARDUINO_EVENT_ETH_CONNECTED:    Serial.println("ETH link up"); break;
     case ARDUINO_EVENT_ETH_GOT_IP:
       Serial.print("ETH IP: "); Serial.println(ETH.localIP());
-      ethGotIp = true;
       break;
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       Serial.println("ETH link down");
-      ethGotIp = false;
       break;
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       Serial.print("WiFi IP: "); Serial.println(WiFi.localIP());
-      wifiGotIp = true;
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       Serial.println("WiFi disconnected");
-      wifiGotIp = false;
       break;
     default: break;
   }
 }
 
-void row(String &h, const char *k, const char *v, const char *cls = "") {
+void row(String &h, const char *k, const char *v, const char *cls = "");
+void row(String &h, const char *k, const char *v, const char *cls) {
   h += F("<tr><td>"); h += k; h += F("</td><td class='"); h += cls; h += F("'>"); h += v; h += F("</td></tr>");
+}
+
+// ===================== NTP SERVER (UDP 123) =====================
+// Runs in its own task so web rendering in loop() cannot delay the timestamps.
+// One socket per interface, each bound to that interface's IP, so replies always
+// carry the address the client asked.
+static const uint32_t NTP_UNIX_OFFSET = 2208988800UL;   // seconds from 1900 to 1970
+
+volatile uint32_t ntpReqEth = 0, ntpReqWifi = 0, ntpIgnored = 0, ntpDenied = 0, ntpLastClient = 0, ntpLastReqMs = 0;
+WiFiUDP udpEth, udpWifi;
+volatile uint32_t udpEthIp = 0, udpWifiIp = 0;
+
+// Atomic snapshot of the best available UTC time. Returns false if no source is valid.
+bool timeSnapshot(Src &src, uint32_t &epoch, uint32_t &us, bool &aligned) {
+  portENTER_CRITICAL(&timeMux);
+  int64_t nowUs = esp_timer_get_time();
+  uint32_t nowMs = (uint32_t)(nowUs / 1000);
+  src = SRC_NONE; epoch = 0; us = 0; aligned = false;
+  for (int k = 0; k < 3 && src == SRC_NONE; k++) {
+    int id = srcOrder[k];
+    if (!cfg.srcEnabled[id]) continue;
+    if (id < 2) {
+      if (gn[id].anchorValid && (uint32_t)(nowMs - gn[id].anchorWallMs) < GNSS_HOLD_MS) {
+        int64_t el = nowUs - gn[id].anchorUs;
+        epoch = gn[id].anchorEpoch + (uint32_t)(el / 1000000);
+        us = (uint32_t)(el % 1000000);
+        aligned = gn[id].ppsAligned;
+        src = (id == 0) ? SRC_GNSS1 : SRC_GNSS2;
+      }
+    } else if (rtcPresent && rtcValid) {
+      int64_t el = nowUs - rtcReadUs;
+      epoch = rtcEpoch + (uint32_t)(el / 1000000);
+      us = (uint32_t)(el % 1000000);          // DS3231 read-out is whole seconds, sub-second phase is arbitrary
+      src = SRC_RTC;
+    }
+  }
+  portEXIT_CRITICAL(&timeMux);
+  return src != SRC_NONE;
+}
+
+static inline void put32(uint8_t *p, uint32_t v) {
+  p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v;
+}
+static inline uint32_t ntpFrac(uint32_t us) {
+  return (uint32_t)(((uint64_t)us << 32) / 1000000ULL);
+}
+
+void ntpServe(WiFiUDP &u, bool isEth) {
+  int sz = u.parsePacket();
+  if (sz <= 0) return;
+  Src s; uint32_t rxSec, rxUs; bool al;
+  bool ok = timeSnapshot(s, rxSec, rxUs, al);                 // receive timestamp, taken as early as possible
+  uint8_t req[48];
+  if (sz < 48 || u.read(req, 48) < 48 || (req[0] & 7) != 3) { // only plain client requests (mode 3)
+    ntpIgnored = ntpIgnored + 1;
+    return;
+  }
+  IPAddress cip = u.remoteIP();
+  uint16_t cport = u.remotePort();
+  if (!ntpAllowed((uint32_t)cip)) { ntpDenied = ntpDenied + 1; return; }   // not on the allow list: stay silent
+
+  uint8_t vn = (req[0] >> 3) & 7;
+  if (vn < 1 || vn > 4) vn = 4;
+  uint8_t li = 0, stratum = 16;
+  int8_t prec = -6;
+  uint32_t rootDisp = 0;
+  uint8_t refid[4] = {0, 0, 0, 0};
+  if (!ok) {
+    li = 3;                                                   // alarm: clock not synchronised
+  } else if (s == SRC_RTC) {
+    stratum = 4; prec = 0; rootDisp = 131072;                 // ~2 s (16.16 fixed point seconds)
+  } else {
+    stratum = 1; refid[0] = 'G'; refid[1] = 'P'; refid[2] = 'S';
+    prec = al ? -20 : -10;
+    rootDisp = al ? 66 : 32768;                               // ~1 ms with PPS, ~0.5 s without
+  }
+
+  uint8_t resp[48];
+  memset(resp, 0, sizeof resp);
+  resp[0] = (li << 6) | (vn << 3) | 4;                        // server mode
+  resp[1] = stratum;
+  resp[2] = req[2];                                           // echo poll
+  resp[3] = (uint8_t)prec;
+  put32(resp + 8, rootDisp);
+  memcpy(resp + 12, refid, 4);
+  memcpy(resp + 24, req + 40, 8);                             // origin = client's transmit timestamp
+  if (ok) {
+    put32(resp + 16, rxSec + NTP_UNIX_OFFSET);                // reference timestamp
+    put32(resp + 32, rxSec + NTP_UNIX_OFFSET);                // receive timestamp
+    put32(resp + 36, ntpFrac(rxUs));
+    Src s2; uint32_t txSec, txUs; bool al2;
+    if (timeSnapshot(s2, txSec, txUs, al2)) {                 // transmit timestamp, right before sending
+      put32(resp + 40, txSec + NTP_UNIX_OFFSET);
+      put32(resp + 44, ntpFrac(txUs));
+    }
+  }
+  u.beginPacket(cip, cport);
+  u.write(resp, 48);
+  u.endPacket();
+
+  if (isEth) ntpReqEth = ntpReqEth + 1; else ntpReqWifi = ntpReqWifi + 1;
+  ntpLastClient = (uint32_t)cip;
+  ntpLastReqMs = millis();
+}
+
+// (Re)binds each socket whenever its interface gets, loses or changes its IP.
+void ntpManageSockets() {
+  static uint32_t nextTry = 0;
+  if ((int32_t)(millis() - nextTry) < 0) return;
+  uint32_t e = ethGotIp ? (uint32_t)ETH.localIP() : 0;
+  if (e != udpEthIp) {
+    if (udpEthIp) udpEth.stop();
+    udpEthIp = e;
+    if (e && !udpEth.begin(IPAddress(e), 123)) { udpEthIp = 0; nextTry = millis() + 2000; }
+  }
+  uint32_t w = wifiGotIp ? (uint32_t)WiFi.localIP() : 0;
+  if (w != udpWifiIp) {
+    if (udpWifiIp) udpWifi.stop();
+    udpWifiIp = w;
+    if (w && !udpWifi.begin(IPAddress(w), 123)) { udpWifiIp = 0; nextTry = millis() + 2000; }
+  }
+}
+
+void ntpTask(void *) {
+  for (;;) {
+    ntpManageSockets();
+    if (udpEthIp) ntpServe(udpEth, true);
+    if (udpWifiIp) ntpServe(udpWifi, false);
+    vTaskDelay(1);
+  }
+}
+
+void addNtp(String &h) {
+  char b[112];
+  h += F("<h2>NTP server (UDP 123)</h2><table>");
+  Src s; uint32_t sec, us; bool al;
+  if (!timeSnapshot(s, sec, us, al)) {
+    row(h, "Serving", "NOT SYNCED - replies flagged unsynchronised", "bad");
+  } else if (s == SRC_RTC) {
+    row(h, "Serving", "stratum 4 from RTC (accuracy about +-1 s)", "warn");
+  } else {
+    snprintf(b, sizeof b, "stratum 1 from %s, %s", SRC_NAME[s], al ? "PPS-aligned" : "no PPS alignment");
+    row(h, "Serving", b, al ? "ok" : "warn");
+  }
+  String ei = udpEthIp ? IPAddress((uint32_t)udpEthIp).toString() : String("-");
+  String wi = udpWifiIp ? IPAddress((uint32_t)udpWifiIp).toString() : String("-");
+  snprintf(b, sizeof b, "ETH %s, WiFi %s", ei.c_str(), wi.c_str());
+  row(h, "Listening on", b, (udpEthIp || udpWifiIp) ? "ok" : "warn");
+  snprintf(b, sizeof b, "%lu via ETH, %lu via WiFi, %lu ignored, %lu denied",
+           (unsigned long)ntpReqEth, (unsigned long)ntpReqWifi, (unsigned long)ntpIgnored, (unsigned long)ntpDenied);
+  row(h, "Requests", b);
+  if (ntpLastClient) {
+    String c = IPAddress((uint32_t)ntpLastClient).toString();
+    snprintf(b, sizeof b, "%s, %lu s ago", c.c_str(), (unsigned long)((millis() - ntpLastReqMs) / 1000));
+    row(h, "Last client", b);
+  }
+  h += F("</table>");
 }
 
 void addGnss(String &h, int i) {
@@ -379,7 +682,9 @@ void addRtc(String &h, Src sel) {
 void addEth(String &h) {
   char b[96];
   h += F("<h2>Ethernet (W5500)</h2><table>");
+  if (!cfg.ethEnabled) { row(h, "Link", "DISABLED in settings", "warn"); h += F("</table>"); return; }
   row(h, "Link", ETH.linkUp() ? "UP" : "DOWN", ETH.linkUp() ? "ok" : "bad");
+  row(h, "Addressing", cfg.ethDhcp ? "DHCP" : "static");
   String ip = ethGotIp ? ETH.localIP().toString() : String("no lease yet");
   row(h, "IP", ip.c_str(), ethGotIp ? "ok" : "warn");
   snprintf(b, sizeof b, "%u Mbps, %s duplex", (unsigned)ETH.linkSpeed(), ETH.fullDuplex() ? "full" : "half");
@@ -395,8 +700,9 @@ void addWifi(String &h) {
   char b[96];
   h += F("<h2>WiFi</h2><table>");
   bool up = (WiFi.status() == WL_CONNECTED);
-  row(h, "Link", up ? "CONNECTED" : (WIFI_ENABLED ? "DISCONNECTED" : "DISABLED"), up ? "ok" : (WIFI_ENABLED ? "bad" : "warn"));
-  row(h, "SSID", WIFI_SSID);
+  row(h, "Link", up ? "CONNECTED" : (cfg.wifiEnabled ? "DISCONNECTED" : "DISABLED in settings"), up ? "ok" : (cfg.wifiEnabled ? "bad" : "warn"));
+  row(h, "SSID", cfg.wifiSsid);
+  row(h, "Addressing", cfg.wifiDhcp ? "DHCP" : "static");
   String ip = wifiGotIp ? WiFi.localIP().toString() : String("no lease yet");
   row(h, "IP", ip.c_str(), wifiGotIp ? "ok" : "warn");
   if (up) {
@@ -421,7 +727,7 @@ String buildPage() {
          "body{font-family:sans-serif;max-width:720px;margin:1em auto;padding:0 1em}"
          "table{border-collapse:collapse;width:100%}td{border-bottom:1px solid #8884;padding:4px 6px}"
          "td:first-child{width:34%;opacity:.7}.ok{color:#1a9c3c}.warn{color:#d98a00}.bad{color:#d62828}"
-         ".clock{font-size:2em;font-weight:600}h2{margin:1em 0 .3em}</style></head><body>");
+         ".clock{font-size:2em;font-weight:600}h2{margin:1em 0 .3em}</style></head><body><div><a href='/settings'>Settings</a></div>");
   if (have) {
     char t[40];
     fmtTime(ep, t, sizeof t);
@@ -429,6 +735,7 @@ String buildPage() {
   } else {
     h += F("<div class='clock bad'>NO VALID TIME SOURCE</div>");
   }
+  addNtp(h);
   addGnss(h, 0);
   addGnss(h, 1);
   addRtc(h, sel);
@@ -438,20 +745,365 @@ String buildPage() {
   return h;
 }
 
+// ===================== WEB: HTTP, PASSWORD, SETTINGS PAGE =====================
+struct HttpReq {
+  String method, path, auth, body;
+  int contentLen = 0;
+};
+
+String base64Encode(const String &in) {
+  unsigned char out[128];
+  size_t olen = 0;
+  if (mbedtls_base64_encode(out, sizeof out, &olen, (const unsigned char *)in.c_str(), in.length()) != 0) return String();
+  String s;
+  s.reserve(olen);
+  for (size_t i = 0; i < olen; i++) s += (char)out[i];
+  return s;
+}
+
+// HTTP Basic auth, user "admin". Credentials travel unencrypted, so this protects against casual access only.
+bool authOk(const String &hdr) {
+  if (!cfg.webPass[0]) return true;
+  String expect = String("Basic ") + base64Encode(String("admin:") + cfg.webPass);
+  if (hdr.length() != expect.length()) return false;
+  uint8_t d = 0;
+  for (unsigned i = 0; i < expect.length(); i++) d |= (uint8_t)(hdr[i] ^ expect[i]);
+  return d == 0;
+}
+
+bool readHttpRequest(NetworkClient &c, HttpReq &r) {
+  uint32_t t0 = millis();
+  String line;
+  bool first = true, headersDone = false;
+  while (c.connected() || c.available()) {
+    if (millis() - t0 > 3000) return false;
+    if (!c.available()) { gnssPoll(0); gnssPoll(1); delay(1); continue; }
+    char ch = (char)c.read();
+    if (!headersDone) {
+      if (ch == '\r') continue;
+      if (ch != '\n') { if (line.length() < 300) line += ch; continue; }
+      if (line.length() == 0) {
+        headersDone = true;
+        if (r.contentLen <= 0) return true;
+        continue;
+      }
+      if (first) {
+        first = false;
+        int a = line.indexOf(' ');
+        int b = line.indexOf(' ', a + 1);
+        if (a < 0 || b < 0) return false;
+        r.method = line.substring(0, a);
+        r.path = line.substring(a + 1, b);
+      } else {
+        String lower = line;
+        lower.toLowerCase();
+        if (lower.startsWith("authorization:")) { r.auth = line.substring(14); r.auth.trim(); }
+        else if (lower.startsWith("content-length:")) {
+          r.contentLen = line.substring(15).toInt();
+          if (r.contentLen > 3000) return false;
+        }
+      }
+      line = "";
+    } else {
+      r.body += ch;
+      if ((int)r.body.length() >= r.contentLen) return true;
+    }
+  }
+  return headersDone && (int)r.body.length() >= r.contentLen;
+}
+
+String urlDecode(const String &s) {
+  String o;
+  o.reserve(s.length());
+  for (unsigned i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '+') o += ' ';
+    else if (c == '%' && i + 2 < s.length()) {
+      char hx[3] = {s[i + 1], s[i + 2], 0};
+      o += (char)strtol(hx, nullptr, 16);
+      i += 2;
+    } else o += c;
+  }
+  return o;
+}
+
+bool formFind(const String &b, const char *key, String *val = nullptr) {
+  String k = String(key) + "=";
+  unsigned pos = 0;
+  while (pos < b.length()) {
+    int amp = b.indexOf('&', pos);
+    unsigned end = (amp < 0) ? b.length() : (unsigned)amp;
+    if (b.startsWith(k, pos)) {
+      if (val) *val = urlDecode(b.substring(pos + k.length(), end));
+      return true;
+    }
+    pos = end + 1;
+  }
+  return false;
+}
+String formGet(const String &b, const char *key) {
+  String v;
+  formFind(b, key, &v);
+  return v;
+}
+
+String htmlEsc(const char *s) {
+  String o;
+  for (; *s; s++) {
+    switch (*s) {
+      case '&':  o += F("&amp;"); break;
+      case '<':  o += F("&lt;"); break;
+      case '>':  o += F("&gt;"); break;
+      case '"':  o += F("&quot;"); break;
+      case '\'': o += F("&#39;"); break;
+      default:   o += *s;
+    }
+  }
+  return o;
+}
+
+String ipStr(uint32_t v) { return v ? IPAddress(v).toString() : String(""); }
+
+// Reads an optional IPv4 field. Empty -> 0. Returns false (and sets err) if non-empty and invalid.
+bool ipField(const String &b, const char *key, uint32_t &out, String &err, const char *label) {
+  String v = formGet(b, key);
+  v.trim();
+  out = 0;
+  if (v.length() == 0) return true;
+  IPAddress ip;
+  if (!ip.fromString(v.c_str())) { err = String(label) + " is not a valid IPv4 address."; return false; }
+  out = (uint32_t)ip;
+  return true;
+}
+
+// Validates the posted form into `draft`. Returns an error message, or "" after saving into cfg + flash.
+String applySettingsForm(const String &b) {
+  Settings &n = draft;
+  n = cfg;
+  String v, err;
+
+  v = formGet(b, "host");
+  v.trim();
+  if (v.length() < 1 || v.length() > 32) return "Hostname must be 1-32 characters.";
+  for (unsigned i = 0; i < v.length(); i++) {
+    char c = v[i];
+    if (!(isalnum((unsigned char)c) || c == '-')) return "Hostname may only contain letters, digits and '-'.";
+  }
+  strlcpy(n.hostname, v.c_str(), sizeof n.hostname);
+
+  n.ethEnabled = formFind(b, "eEn");
+  n.ethDhcp = (formGet(b, "eMode") != "static");
+  if (!ipField(b, "eIp", n.ethIp, err, "Ethernet IP") || !ipField(b, "eMask", n.ethMask, err, "Ethernet mask") ||
+      !ipField(b, "eGw", n.ethGw, err, "Ethernet gateway") || !ipField(b, "eDns", n.ethDns, err, "Ethernet DNS")) return err;
+  if (n.ethEnabled && !n.ethDhcp && (!n.ethIp || !n.ethMask || !n.ethGw)) return "Static Ethernet needs IP, mask and gateway.";
+
+  n.wifiEnabled = formFind(b, "wEn");
+  n.wifiDhcp = (formGet(b, "wMode") != "static");
+  v = formGet(b, "wSsid");
+  v.trim();
+  if (n.wifiEnabled && (v.length() < 1 || v.length() > 32)) return "WiFi SSID must be 1-32 characters.";
+  if (v.length()) strlcpy(n.wifiSsid, v.c_str(), sizeof n.wifiSsid);
+  v = formGet(b, "wPass");
+  if (formFind(b, "wPassClr")) {
+    n.wifiPass[0] = 0;
+  } else if (v.length()) {
+    if (v.length() < 8 || v.length() > 63) return "WiFi password must be 8-63 characters.";
+    strlcpy(n.wifiPass, v.c_str(), sizeof n.wifiPass);
+  }
+  if (!ipField(b, "wIp", n.wifiIp, err, "WiFi IP") || !ipField(b, "wMask", n.wifiMask, err, "WiFi mask") ||
+      !ipField(b, "wGw", n.wifiGw, err, "WiFi gateway") || !ipField(b, "wDns", n.wifiDns, err, "WiFi DNS")) return err;
+  if (n.wifiEnabled && !n.wifiDhcp && (!n.wifiIp || !n.wifiMask || !n.wifiGw)) return "Static WiFi needs IP, mask and gateway.";
+
+  if (!n.ethEnabled && !n.wifiEnabled) return "Enable at least one interface, or the device becomes unreachable.";
+
+  for (int i = 0; i < 3; i++) {
+    char k[8];
+    snprintf(k, sizeof k, "sEn%d", i);
+    n.srcEnabled[i] = formFind(b, k);
+    snprintf(k, sizeof k, "sP%d", i);
+    int p = formGet(b, k).toInt();
+    n.srcPrio[i] = (p >= 1 && p <= 3) ? p : (i + 1);
+  }
+  if (!n.srcEnabled[0] && !n.srcEnabled[1] && !n.srcEnabled[2]) return "Enable at least one time source.";
+
+  String p1 = formGet(b, "newPass"), p2 = formGet(b, "newPass2");
+  if (formFind(b, "noPass")) {
+    n.webPass[0] = 0;
+  } else if (p1.length() || p2.length()) {
+    if (p1 != p2) return "The two web passwords do not match.";
+    if (p1.length() < 4 || p1.length() > 32) return "Web password must be 4-32 characters.";
+    strlcpy(n.webPass, p1.c_str(), sizeof n.webPass);
+  }
+
+  v = formGet(b, "allow");
+  v.trim();
+  if (v.length() > 128) return "Allowed-clients list is too long (128 characters max).";
+  uint32_t tn[8], tm[8];
+  uint8_t tc;
+  if (!parseAllowList(v.c_str(), tn, tm, tc)) return "Allowed clients: use IPs or CIDR like 192.168.1.0/24, comma separated, max 8 entries.";
+  strlcpy(n.allow, v.c_str(), sizeof n.allow);
+
+  cfg = n;
+  settingsSave();
+  return "";
+}
+
+static void optionTag(String &h, const char *value, const char *label, bool sel) {
+  h += F("<option value='"); h += value; h += F("'");
+  if (sel) h += F(" selected");
+  h += F(">"); h += label; h += F("</option>");
+}
+static void textField(String &h, const char *label, const char *name, const String &value, const char *type = "text") {
+  h += F("<label>"); h += label; h += F("<input type='"); h += type; h += F("' name='"); h += name;
+  h += F("' value='"); h += htmlEsc(value.c_str()); h += F("'></label>");
+}
+static void checkField(String &h, const char *label, const char *name, bool on) {
+  h += F("<label class='chk'><input type='checkbox' name='"); h += name; h += F("' value='1'");
+  if (on) h += F(" checked");
+  h += F("> "); h += label; h += F("</label>");
+}
+static void addressing(String &h, const char *selName, bool dhcp) {
+  h += F("<label>Addressing<select name='"); h += selName; h += F("'>");
+  optionTag(h, "dhcp", "DHCP (automatic)", dhcp);
+  optionTag(h, "static", "Static IP", !dhcp);
+  h += F("</select></label>");
+}
+
+String buildSettingsPage(const String &msg, bool isErr, const Settings &s) {
+  String h;
+  h.reserve(9000);
+  h += F("<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+         "<title>Settings</title><style>"
+         "body{font-family:sans-serif;max-width:720px;margin:1em auto;padding:0 1em}"
+         "label{display:block;margin:.4em 0}"
+         "label input[type=text],label input[type=password],label select{display:block;width:100%;box-sizing:border-box;padding:4px;margin-top:2px}"
+         "label.chk{display:flex;gap:.5em;align-items:center}"
+         "fieldset{margin:1em 0;border:1px solid #8886;border-radius:6px}legend{font-weight:600}"
+         ".msg{padding:.6em;border-radius:6px;margin:1em 0}.err{background:#d6282822;color:#d62828}.okm{background:#1a9c3c22;color:#1a9c3c}"
+         "button{padding:.5em 1.2em;margin-top:.5em}small{opacity:.7}</style></head><body>");
+  h += F("<a href='/'>&larr; Status</a><h1>Settings</h1>");
+  if (msg.length()) {
+    h += isErr ? F("<div class='msg err'>") : F("<div class='msg okm'>");
+    h += htmlEsc(msg.c_str());
+    h += F("</div>");
+  }
+  if (!cfg.webPass[0]) h += F("<div class='msg err'>No web password is set: anyone on this network can open this page and change the settings.</div>");
+  h += F("<form method='post' action='/settings'>");
+
+  h += F("<fieldset><legend>Device</legend>");
+  textField(h, "Hostname (letters, digits, '-')", "host", String(s.hostname));
+  h += F("</fieldset>");
+
+  h += F("<fieldset><legend>Ethernet (W5500)</legend>");
+  checkField(h, "Enabled", "eEn", s.ethEnabled);
+  addressing(h, "eMode", s.ethDhcp);
+  textField(h, "IP address (static only)", "eIp", ipStr(s.ethIp));
+  textField(h, "Subnet mask (static only)", "eMask", ipStr(s.ethMask));
+  textField(h, "Gateway (static only)", "eGw", ipStr(s.ethGw));
+  textField(h, "DNS (static only, blank = gateway)", "eDns", ipStr(s.ethDns));
+  h += F("</fieldset>");
+
+  h += F("<fieldset><legend>WiFi</legend>");
+  checkField(h, "Enabled", "wEn", s.wifiEnabled);
+  textField(h, "SSID", "wSsid", String(s.wifiSsid));
+  textField(h, "Password (blank = keep current)", "wPass", String(""), "password");
+  checkField(h, "Open network (clear the saved password)", "wPassClr", false);
+  addressing(h, "wMode", s.wifiDhcp);
+  textField(h, "IP address (static only)", "wIp", ipStr(s.wifiIp));
+  textField(h, "Subnet mask (static only)", "wMask", ipStr(s.wifiMask));
+  textField(h, "Gateway (static only)", "wGw", ipStr(s.wifiGw));
+  textField(h, "DNS (static only, blank = gateway)", "wDns", ipStr(s.wifiDns));
+  h += F("</fieldset>");
+
+  static const char *names[3] = {"GNSS1 (ME31GR01)", "GNSS2 (NEO-M8N)", "RTC (DS3231)"};
+  h += F("<fieldset><legend>Time sources (priority 1 = used first)</legend>");
+  for (int i = 0; i < 3; i++) {
+    char kEn[8], kP[8];
+    snprintf(kEn, sizeof kEn, "sEn%d", i);
+    snprintf(kP, sizeof kP, "sP%d", i);
+    h += F("<div style='display:flex;gap:1em;align-items:center'>");
+    h += F("<label class='chk' style='flex:1'><input type='checkbox' name='"); h += kEn; h += F("' value='1'");
+    if (s.srcEnabled[i]) h += F(" checked");
+    h += F("> "); h += names[i]; h += F("</label><select name='"); h += kP; h += F("' style='width:5em'>");
+    for (int p = 1; p <= 3; p++) {
+      char pv[4];
+      snprintf(pv, sizeof pv, "%d", p);
+      optionTag(h, pv, pv, s.srcPrio[i] == p);
+    }
+    h += F("</select></div>");
+  }
+  h += F("</fieldset>");
+
+  h += F("<fieldset><legend>Web access</legend>"
+         "<small>User name is <b>admin</b>. The password is sent unencrypted over HTTP, so it only keeps casual users out.</small>");
+  textField(h, "New password (blank = keep current)", "newPass", String(""), "password");
+  textField(h, "Repeat new password", "newPass2", String(""), "password");
+  checkField(h, "Remove the password (open access)", "noPass", false);
+  h += F("</fieldset>");
+
+  h += F("<fieldset><legend>NTP access</legend>");
+  textField(h, "Allowed clients (IPs or CIDR, comma separated; blank = everyone)", "allow", String(s.allow));
+  h += F("</fieldset>");
+
+  h += F("<button type='submit'>Save and restart</button></form>"
+         "<form method='post' action='/reset' onsubmit=\"return confirm('Erase all settings and restart?')\">"
+         "<button type='submit'>Factory reset</button></form>"
+         "<p><small>If you get locked out, open the serial monitor and type <b>reset-settings</b> then Enter.</small></p>"
+         "</body></html>");
+  return h;
+}
+
+void sendResponse(NetworkClient &c, const char *status, const String &body, const char *extraHeaders = "") {
+  c.print("HTTP/1.1 "); c.print(status);
+  c.print("\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\n");
+  c.print(extraHeaders);
+  c.print("Content-Length: "); c.print(body.length());
+  c.print("\r\n\r\n");
+  c.print(body);
+}
+
+static const char *RESTART_PAGE =
+  "<!DOCTYPE html><html><head><meta charset='utf-8'><meta http-equiv='refresh' content='15;url=/'></head>"
+  "<body><h3>Saved. Restarting...</h3><p>Reloading in 15 s. If the IP address changed, open the new one.</p></body></html>";
+
 void serveWeb() {
   NetworkClient c = server.accept();
   if (!c) return;
-  uint32_t t0 = millis();
-  while (c.connected() && !c.available() && millis() - t0 < 300) {
-    gnssPoll(0); gnssPoll(1);
+  HttpReq r;
+  if (!readHttpRequest(c, r)) { c.stop(); return; }
+  int q = r.path.indexOf('?');
+  if (q >= 0) r.path = r.path.substring(0, q);
+
+  if (!authOk(r.auth)) {
+    sendResponse(c, "401 Unauthorized", String("<h3>Password required</h3>"),
+                 "WWW-Authenticate: Basic realm=\"Zaimu NTP server\"\r\n");
+    c.stop();
+    return;
   }
-  while (c.available()) c.read();               // request content is ignored, every path returns the status page
-  String body = buildPage();
-  c.print("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n"
-          "Connection: close\r\nContent-Length: ");
-  c.print(body.length());
-  c.print("\r\n\r\n");
-  c.print(body);
+  bool post = (r.method == "POST");
+  if (r.path == "/settings" && post) {
+    String err = applySettingsForm(r.body);
+    if (err.length()) {
+      sendResponse(c, "200 OK", buildSettingsPage(err, true, draft));
+    } else {
+      sendResponse(c, "200 OK", String(RESTART_PAGE));
+      c.stop();
+      delay(500);
+      ESP.restart();
+    }
+  } else if (r.path == "/settings") {
+    sendResponse(c, "200 OK", buildSettingsPage("", false, cfg));
+  } else if (r.path == "/reset" && post) {
+    settingsErase();
+    sendResponse(c, "200 OK", String(RESTART_PAGE));
+    c.stop();
+    delay(500);
+    ESP.restart();
+  } else if (r.path == "/" || r.path == "/index.html") {
+    sendResponse(c, "200 OK", buildPage());
+  } else {
+    sendResponse(c, "404 Not Found", String("<h3>Not found</h3>"));
+  }
   c.stop();
 }
 
@@ -467,12 +1119,12 @@ void printStatus() {
   uint32_t p0, p1; int64_t u;
   readPps(0, p0, u);
   readPps(1, p1, u);
-  String eip = ethGotIp ? ETH.localIP().toString() : String("no IP");
-  String wip = wifiGotIp ? WiFi.localIP().toString() : String(WIFI_ENABLED ? "no IP" : "off");
-  Serial.printf("%s | src=%s | G1: %s (PPS %lu) | G2: %s (PPS %lu) | RTC: %s | ETH: %s | WIFI: %s\n",
+  String eip = ethGotIp ? ETH.localIP().toString() : String(cfg.ethEnabled ? "no IP" : "off");
+  String wip = wifiGotIp ? WiFi.localIP().toString() : String(cfg.wifiEnabled ? "no IP" : "off");
+  Serial.printf("%s | src=%s | G1: %s (PPS %lu) | G2: %s (PPS %lu) | RTC: %s | ETH: %s | WIFI: %s | NTP: %lu req\n",
                 t, SRC_NAME[s], s0, (unsigned long)p0, s1, (unsigned long)p1,
                 !rtcPresent ? "missing" : (rtcValid ? "ok" : "invalid"),
-                eip.c_str(), wip.c_str());
+                eip.c_str(), wip.c_str(), (unsigned long)(ntpReqEth + ntpReqWifi));
 }
 
 // ===================== SETUP / LOOP =====================
@@ -480,6 +1132,10 @@ void setup() {
   Serial.begin(115200);
   delay(1500);
   Serial.println("\nBooting...");
+  settingsLoad();
+  settingsApplyDerived();
+  Serial.println("Type reset-settings + Enter to erase saved settings.");
+  Network.setHostname(cfg.hostname);
 
   // GNSS1 reset. ASSUMES ACTIVE-LOW: the pin is only ever driven low or released (high-Z), never driven high.
   if (GNSS1_RESET_ON_BOOT) {
@@ -496,22 +1152,33 @@ void setup() {
   rtcInitOk = rtc.begin(&Wire);
   pollRtc();
 
-  pinMode(W5500_RST_PIN, OUTPUT);
-  digitalWrite(W5500_RST_PIN, LOW);
-  delay(100);
-  digitalWrite(W5500_RST_PIN, HIGH);
-  delay(200);
-
   Network.onEvent(onEvent);
-  SPI.begin(W5500_SCLK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN, W5500_CS_PIN);
-  ETH.begin(ETH_PHY_W5500, 1, W5500_CS_PIN, W5500_INT_PIN, W5500_RST_PIN, SPI);
-  if (WIFI_ENABLED) {
+  if (cfg.ethEnabled) {
+    pinMode(W5500_RST_PIN, OUTPUT);
+    digitalWrite(W5500_RST_PIN, LOW);
+    delay(100);
+    digitalWrite(W5500_RST_PIN, HIGH);
+    delay(200);
+    SPI.begin(W5500_SCLK_PIN, W5500_MISO_PIN, W5500_MOSI_PIN, W5500_CS_PIN);
+    ETH.begin(ETH_PHY_W5500, 1, W5500_CS_PIN, W5500_INT_PIN, W5500_RST_PIN, SPI);
+    if (!cfg.ethDhcp) {
+      ETH.config(IPAddress(cfg.ethIp), IPAddress(cfg.ethGw), IPAddress(cfg.ethMask),
+                 IPAddress(cfg.ethDns ? cfg.ethDns : cfg.ethGw));
+    }
+  }
+  if (cfg.wifiEnabled) {
     WiFi.persistent(false);
     WiFi.mode(WIFI_STA);
+    if (!cfg.wifiDhcp) {
+      WiFi.config(IPAddress(cfg.wifiIp), IPAddress(cfg.wifiGw), IPAddress(cfg.wifiMask),
+                  IPAddress(cfg.wifiDns ? cfg.wifiDns : cfg.wifiGw));
+    }
     WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASS);   // non-blocking; IP arrives via the event handler
+    WiFi.setSleep(false);               // modem sleep adds tens of ms of NTP jitter
+    WiFi.begin(cfg.wifiSsid, cfg.wifiPass[0] ? cfg.wifiPass : nullptr);   // non-blocking
   }
   server.begin();
+  xTaskCreatePinnedToCore(ntpTask, "ntp", 6144, nullptr, 10, nullptr, 1);
 }
 
 void loop() {
@@ -525,6 +1192,31 @@ void loop() {
 
   static uint32_t lastPrint = 0;
   if (millis() - lastPrint >= 1000) { lastPrint = millis(); printStatus(); }
+
+  static uint32_t lastNetPoll = 0;
+  if (millis() - lastNetPoll >= 500) {
+    lastNetPoll = millis();
+    ethGotIp = cfg.ethEnabled && ETH.linkUp() && ((uint32_t)ETH.localIP() != 0);
+    wifiGotIp = cfg.wifiEnabled && (WiFi.status() == WL_CONNECTED) && ((uint32_t)WiFi.localIP() != 0);
+  }
+
+  // Recovery: type "reset-settings" + Enter in the serial monitor to erase the saved settings.
+  static String cmd;
+  while (Serial.available()) {
+    char ch = (char)Serial.read();
+    if (ch == '\n' || ch == '\r') {
+      cmd.trim();
+      if (cmd == "reset-settings") {
+        settingsErase();
+        Serial.println("Settings erased, restarting...");
+        delay(300);
+        ESP.restart();
+      }
+      cmd = "";
+    } else if (cmd.length() < 40) {
+      cmd += ch;
+    }
+  }
 
   if (ethGotIp || wifiGotIp) serveWeb();
   delay(1);
